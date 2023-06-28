@@ -1,0 +1,173 @@
+name: Containerized Train CI/CD
+run-name: Train CI/CD
+on: [push]
+env:
+  CLUSTER: amineb-cluster
+  CLUSTER_ZONE: europe-west1-b
+jobs:
+  build:
+    name: Build and analyze
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+      - name: Set up JDK 11
+        uses: actions/setup-java@v3
+        with:
+          java-version: 11
+          distribution: 'zulu' # Alternative distribution options are available
+      - name: Cache SonarCloud packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+      - name: Cache Gradle packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
+          restore-keys: ${{ runner.os }}-gradle
+      - name: Build and analyze
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Needed to get PR information, if any
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: ./gradlew build sonarqube --info
+  BuildAndPushDockerImage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push the Docker image
+        uses: docker/build-push-action@v3
+        with:
+          push: true
+          tags: |
+            mbouzayeni/train-schedule:${{ github.sha }}
+          cache-from: type=registry,ref=mbouzayeni/train-schedule:buildcache
+          cache-to: type=registry,ref=mbouzayeni/train-schedule:buildcache,mode=max              
+  DeployCanary:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    needs: BuildAndPushDockerImage
+    permissions:
+     contents: 'read'
+     id-token: 'write'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          workload_identity_provider: 'projects/258456138807/locations/global/workloadIdentityPools/github-actions/providers/github-actions-oidc'
+          service_account: '258456138807-compute@developer.gserviceaccount.com'
+          project_id: playground-s-11-7999ef7a
+          cleanup_credentials: false
+      - name: Connect to GKE
+        uses: google-github-actions/get-gke-credentials@v0
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.CLUSTER_ZONE }}
+      - name: Replace the variables in the kubernetes config file
+        uses: cschleiden/replace-tokens@v1
+        with:
+          files: '["./train-schedule-kube-canary.yml"]'
+          tokenPrefix: __
+          tokenSuffix: __
+        env:
+          DOCKER_IMAGE_NAME: mbouzayeni/train-schedule
+          BUILD_NUMBER: ${{ github.sha }}
+          CANARY_REPLICAS: 1
+
+      - name: Deploy to the gke cluster
+        run: kubectl apply -f train-schedule-kube-canary.yml
+  SmokeTestsOnCanaryPods:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    needs: DeployCanary
+    steps:
+      - name: Run Smoke Tests
+        run: |
+            response=$(curl -s -o /dev/null -w "%{http_code}"  http://35.233.35.115:30081/)
+            if [[ $response != 200 ]]
+              then
+              echo "Smoke test against the canary deployment failed"
+              exit 1
+            else
+              echo "The smoke tests were passed"  
+            fi  
+  DeleteCanaryDeployment:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' && success() || failure()
+    needs: SmokeTestsOnCanaryPods
+    permissions:
+     contents: 'read'
+     id-token: 'write'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          workload_identity_provider: 'projects/258456138807/locations/global/workloadIdentityPools/github-actions/providers/github-actions-oidc'
+          service_account: '258456138807-compute@developer.gserviceaccount.com'
+          project_id: playground-s-11-7999ef7a
+      - name: Connect to GKE
+        uses: google-github-actions/get-gke-credentials@v0
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.CLUSTER_ZONE }}
+      - name: Replace the variables in the kubernetes canary config file
+        uses: cschleiden/replace-tokens@v1
+        with:
+          files: '["./train-schedule-kube-canary.yml"]'
+          tokenPrefix: __
+          tokenSuffix: __
+        env:
+          DOCKER_IMAGE_NAME: mbouzayeni/train-schedule
+          BUILD_NUMBER: ${{ github.sha }}
+          CANARY_REPLICAS: 0
+      - name: Delete the canary pods
+        run: kubectl apply -f train-schedule-kube-canary.yml      
+
+  DeployToKubernetesProduction:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    needs: SmokeTestsOnCanaryPods
+    environment: production
+    permissions:
+     contents: 'read'
+     id-token: 'write'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          workload_identity_provider: 'projects/258456138807/locations/global/workloadIdentityPools/github-actions/providers/github-actions-oidc'
+          service_account: '258456138807-compute@developer.gserviceaccount.com'
+          project_id: playground-s-11-7999ef7a
+      - name: Connect to GKE
+        uses: google-github-actions/get-gke-credentials@v0
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.CLUSTER_ZONE }}
+      - name: Replace the variables in the kubernetes config file
+        uses: cschleiden/replace-tokens@v1
+        with:
+          files: '["./train-schedule-kube.yml"]'
+          tokenPrefix: __
+          tokenSuffix: __
+        env:
+          DOCKER_IMAGE_NAME: mbouzayeni/train-schedule
+          BUILD_NUMBER: ${{ github.sha }}
+      - name: Deploy to production
+        run: kubectl apply -f train-schedule-kube.yml
